@@ -1,0 +1,13 @@
+[package]
+name = "pavlov-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Core traits and vectorization for Pavlov RL library"
+
+[dependencies]
+rand = { workspace = true }
+rand_xoshiro = { workspace = true }
+
+[dev-dependencies]

@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/pavlov-core", "crates/pavlov-envs", "crates/pavlov-python"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["goshea"]
+
+[workspace.dependencies]
+pavlov-core = { path = "crates/pavlov-core" }
+pavlov-envs = { path = "crates/pavlov-envs" }
+rand = "0.8"
+rand_xoshiro = "0.6"
+pyo3 = { version = "0.27", features = ["extension-module"] }
+numpy = "0.27"
