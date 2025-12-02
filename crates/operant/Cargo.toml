@@ -1,0 +1,21 @@
+[package]
+name = "operant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "High-performance SIMD-optimized reinforcement learning environments"
+readme = "../../README.md"
+
+[features]
+default = ["simd"]
+simd = ["operant-envs/simd"]
+parallel = ["operant-envs/parallel"]
+
+[dependencies]
+operant-core = { version = "0.3", path = "../operant-core" }
+operant-envs = { version = "0.3", path = "../operant-envs" }

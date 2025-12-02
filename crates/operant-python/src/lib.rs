@@ -9,6 +9,11 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+#[cfg(feature = "tui")]
+mod tui;
+#[cfg(feature = "tui")]
+use tui::TUILogger;
+
 /// High-performance vectorized CartPole environment.
 ///
 /// Uses SIMD-optimized Rust implementation with zero-copy numpy arrays.
@@ -30,16 +35,20 @@ impl PyCartPoleVecEnv {
     /// # Arguments
     ///
     /// * `num_envs` - Number of parallel environment instances
+    /// * `workers` - Number of worker threads (1 = single-threaded, >1 = parallel with rayon).
+    ///               Requires the `parallel` feature to be enabled.
     ///
     /// # Errors
     ///
     /// Returns `ValueError` if `num_envs` is 0.
     #[new]
-    pub fn new(num_envs: usize) -> PyResult<Self> {
+    #[pyo3(signature = (num_envs, workers=None))]
+    pub fn new(num_envs: usize, workers: Option<usize>) -> PyResult<Self> {
         if num_envs == 0 {
             return Err(PyValueError::new_err("num_envs must be greater than 0"));
         }
-        let inner = CartPole::with_defaults(num_envs);
+        let workers = workers.unwrap_or(1);
+        let inner = CartPole::with_workers(num_envs, workers);
         Ok(Self {
             inner,
             num_envs,
@@ -254,16 +263,20 @@ impl PyMountainCarVecEnv {
     /// # Arguments
     ///
     /// * `num_envs` - Number of parallel environment instances
+    /// * `workers` - Number of worker threads (1 = single-threaded, >1 = parallel with rayon).
+    ///               Requires the `parallel` feature to be enabled.
     ///
     /// # Errors
     ///
     /// Returns `ValueError` if `num_envs` is 0.
     #[new]
-    pub fn new(num_envs: usize) -> PyResult<Self> {
+    #[pyo3(signature = (num_envs, workers=None))]
+    pub fn new(num_envs: usize, workers: Option<usize>) -> PyResult<Self> {
         if num_envs == 0 {
             return Err(PyValueError::new_err("num_envs must be greater than 0"));
         }
-        let inner = MountainCar::with_defaults(num_envs);
+        let workers = workers.unwrap_or(1);
+        let inner = MountainCar::with_workers(num_envs, workers);
         Ok(Self {
             inner,
             num_envs,
@@ -477,16 +490,20 @@ impl PyPendulumVecEnv {
     /// # Arguments
     ///
     /// * `num_envs` - Number of parallel environment instances
+    /// * `workers` - Number of worker threads (1 = single-threaded, >1 = parallel with rayon).
+    ///               Requires the `parallel` feature to be enabled.
     ///
     /// # Errors
     ///
     /// Returns `ValueError` if `num_envs` is 0.
     #[new]
-    pub fn new(num_envs: usize) -> PyResult<Self> {
+    #[pyo3(signature = (num_envs, workers=None))]
+    pub fn new(num_envs: usize, workers: Option<usize>) -> PyResult<Self> {
         if num_envs == 0 {
             return Err(PyValueError::new_err("num_envs must be greater than 0"));
         }
-        let inner = Pendulum::with_defaults(num_envs);
+        let workers = workers.unwrap_or(1);
+        let inner = Pendulum::with_workers(num_envs, workers);
         Ok(Self {
             inner,
             num_envs,
@@ -699,11 +716,24 @@ fn register_envs_module(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+/// Register TUI module if feature is enabled.
+#[cfg(feature = "tui")]
+fn register_tui_module(parent: &Bound<'_, PyModule>) -> PyResult<()> {
+    parent.add_class::<TUILogger>()?;
+    // Alias for backwards compatibility
+    parent.add("Logger", parent.getattr("TUILogger")?)?;
+    Ok(())
+}
+
 /// Operant Python module.
 #[pymodule]
 fn operant(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Register envs submodule
     register_envs_module(m)?;
+
+    // Register TUI logger if feature enabled
+    #[cfg(feature = "tui")]
+    register_tui_module(m)?;
 
     // Backwards compatibility - deprecated imports at root level
     m.add_class::<PyCartPoleVecEnv>()?;

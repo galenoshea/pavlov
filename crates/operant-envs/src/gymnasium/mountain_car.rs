@@ -25,6 +25,11 @@ use rand::SeedableRng;
 #[cfg(feature = "simd")]
 use std::simd::{f32x8, cmp::{SimdPartialOrd, SimdPartialEq}, num::SimdFloat, StdFloat};
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+#[cfg(feature = "parallel")]
+use crate::shared::parallel::SyncPtr;
+
 /// Log data for MountainCar metrics tracking.
 #[derive(Clone, Debug, Default)]
 pub struct MountainCarLog {
@@ -72,6 +77,8 @@ pub struct MountainCar {
     base_seed: u64,
     rng_seeds: Vec<u64>,
     log: MountainCarLog,
+    /// Number of worker threads (1 = single-threaded, >1 = parallel).
+    workers: usize,
 }
 
 impl MountainCar {
@@ -82,8 +89,10 @@ impl MountainCar {
     /// * `num_envs` - Number of parallel environment instances
     /// * `max_steps` - Maximum episode length before truncation
     /// * `init_range` - Range for random initial position values
-    pub fn new(num_envs: usize, max_steps: u32, init_range: f32) -> Self {
+    /// * `workers` - Number of worker threads (1 = single-threaded, >1 = parallel)
+    pub fn new(num_envs: usize, max_steps: u32, init_range: f32, workers: usize) -> Self {
         assert!(num_envs > 0, "num_envs must be at least 1");
+        let workers = workers.max(1);
 
         Self {
             position: vec![0.0; num_envs],
@@ -99,12 +108,36 @@ impl MountainCar {
             base_seed: 0,
             rng_seeds: (0..num_envs as u64).collect(),
             log: MountainCarLog::default(),
+            workers,
         }
     }
 
-    /// Create with default parameters (200 max steps, 0.6 init range).
+    /// Create with default parameters (200 max steps, 0.6 init range, single-threaded).
     pub fn with_defaults(num_envs: usize) -> Self {
-        Self::new(num_envs, MAX_STEPS, 0.6)
+        Self::new(num_envs, MAX_STEPS, 0.6, 1)
+    }
+
+    /// Create with default parameters and specified worker count.
+    pub fn with_workers(num_envs: usize, workers: usize) -> Self {
+        Self::new(num_envs, MAX_STEPS, 0.6, workers)
+    }
+
+    /// Get the number of workers.
+    #[inline]
+    pub fn workers(&self) -> usize {
+        self.workers
+    }
+
+    /// Get the number of environments.
+    #[inline]
+    pub fn num_envs(&self) -> usize {
+        self.num_envs
+    }
+
+    /// Get the observation size per environment.
+    #[inline]
+    pub fn observation_size(&self) -> usize {
+        2
     }
 
     /// Step a single environment (scalar implementation).
@@ -275,8 +308,109 @@ impl MountainCar {
         self.episode_rewards[idx] = 0.0;
     }
 
+    /// Step all environments in parallel across worker threads.
+    #[cfg(feature = "parallel")]
+    pub fn step_parallel(&mut self, actions: &[f32]) {
+        assert_eq!(actions.len(), self.num_envs);
+
+        let num_envs = self.num_envs;
+        let workers = self.workers;
+        let max_steps = self.max_steps;
+
+        let base_chunk_size = num_envs / workers;
+        let chunk_size = (base_chunk_size / 8) * 8;
+        let chunk_size = chunk_size.max(8);
+
+        // SAFETY: Each worker operates on non-overlapping index ranges
+        let position_ptr = unsafe { SyncPtr::new(self.position.as_mut_ptr()) };
+        let velocity_ptr = unsafe { SyncPtr::new(self.velocity.as_mut_ptr()) };
+        let rewards_ptr = unsafe { SyncPtr::new(self.rewards.as_mut_ptr()) };
+        let terminals_ptr = unsafe { SyncPtr::new(self.terminals.as_mut_ptr()) };
+        let truncations_ptr = unsafe { SyncPtr::new(self.truncations.as_mut_ptr()) };
+        let ticks_ptr = unsafe { SyncPtr::new(self.ticks.as_mut_ptr()) };
+        let episode_rewards_ptr = unsafe { SyncPtr::new(self.episode_rewards.as_mut_ptr()) };
+
+        let chunk_logs: Vec<MountainCarLog> = (0..workers)
+            .into_par_iter()
+            .map(|worker_idx| {
+                let start = worker_idx * chunk_size;
+                let end = if worker_idx == workers - 1 {
+                    num_envs
+                } else {
+                    (start + chunk_size).min(num_envs)
+                };
+
+                if start >= num_envs {
+                    return MountainCarLog::default();
+                }
+
+                let mut local_log = MountainCarLog::default();
+
+                for i in start..end {
+                    unsafe {
+                        let action = *actions.get_unchecked(i);
+                        let force_direction = action - 1.0;
+
+                        let mut velocity = *velocity_ptr.add(i);
+                        let mut position = *position_ptr.add(i);
+
+                        velocity += force_direction * FORCE + (position * 3.0).cos() * (-GRAVITY);
+                        velocity = velocity.clamp(-MAX_SPEED, MAX_SPEED);
+                        position += velocity;
+                        position = position.clamp(MIN_POSITION, MAX_POSITION);
+
+                        if position == MIN_POSITION && velocity < 0.0 {
+                            velocity = 0.0;
+                        }
+
+                        *position_ptr.add(i) = position;
+                        *velocity_ptr.add(i) = velocity;
+
+                        let tick = *ticks_ptr.add(i) + 1;
+                        *ticks_ptr.add(i) = tick;
+
+                        let terminal = position >= GOAL_POSITION;
+                        let truncated = tick >= max_steps;
+
+                        *terminals_ptr.add(i) = terminal as u8;
+                        *truncations_ptr.add(i) = truncated as u8;
+
+                        let reward = -1.0;
+                        *rewards_ptr.add(i) = reward;
+
+                        let episode_reward = *episode_rewards_ptr.add(i) + reward;
+                        *episode_rewards_ptr.add(i) = episode_reward;
+
+                        if terminal || truncated {
+                            local_log.total_reward += episode_reward;
+                            local_log.episode_count += 1;
+                            local_log.total_steps += tick;
+                        }
+                    }
+                }
+
+                local_log
+            })
+            .collect();
+
+        for log in chunk_logs {
+            self.log.merge(&log);
+        }
+    }
+
     /// Step with automatic reset for done environments.
     pub fn step_auto_reset(&mut self, actions: &[f32]) {
+        #[cfg(feature = "parallel")]
+        if self.workers > 1 {
+            self.step_parallel(actions);
+            for i in 0..self.num_envs {
+                if self.terminals[i] != 0 || self.truncations[i] != 0 {
+                    self.reset_single_env(i);
+                }
+            }
+            return;
+        }
+
         #[cfg(feature = "simd")]
         {
             self.step_simd(actions);
@@ -421,7 +555,7 @@ mod tests {
 
     #[test]
     fn test_auto_reset() {
-        let mut env = MountainCar::new(2, 10, 0.6);
+        let mut env = MountainCar::new(2, 10, 0.6, 1);
         env.reset(0);
 
         let actions = vec![2.0, 2.0];
@@ -636,5 +770,59 @@ mod tests {
         assert_eq!(env.rewards.len(), 64);
         assert_eq!(env.terminals.len(), 64);
         assert_eq!(env.truncations.len(), 64);
+    }
+
+    #[test]
+    fn test_with_workers() {
+        let env = MountainCar::with_workers(1024, 4);
+        assert_eq!(env.num_envs(), 1024);
+        assert_eq!(env.workers(), 4);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_parallel_matches_scalar() {
+        let mut scalar_env = MountainCar::with_defaults(64);
+        let mut parallel_env = MountainCar::with_workers(64, 4);
+
+        scalar_env.reset(123);
+        parallel_env.reset(123);
+
+        let actions: Vec<f32> = (0..64).map(|i| (i % 3) as f32).collect();
+
+        scalar_env.step_scalar(&actions);
+        parallel_env.step_parallel(&actions);
+
+        for i in 0..64 {
+            assert!(
+                (scalar_env.position[i] - parallel_env.position[i]).abs() < 1e-5,
+                "position mismatch at {}: {} vs {}",
+                i,
+                scalar_env.position[i],
+                parallel_env.position[i]
+            );
+            assert!(
+                (scalar_env.velocity[i] - parallel_env.velocity[i]).abs() < 1e-5,
+                "velocity mismatch at {}: {} vs {}",
+                i,
+                scalar_env.velocity[i],
+                parallel_env.velocity[i]
+            );
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_parallel_auto_reset() {
+        let mut env = MountainCar::with_workers(32, 4);
+        env.reset(0);
+
+        let actions: Vec<f32> = vec![2.0; 32];
+        for _ in 0..200 {
+            env.step_auto_reset(&actions);
+        }
+
+        let log = env.get_log();
+        assert!(log.total_steps > 0, "Should count steps");
     }
 }

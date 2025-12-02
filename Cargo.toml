@@ -1,12 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/operant-core", "crates/operant-envs", "crates/operant-python"]
+members = ["crates/operant", "crates/operant-core", "crates/operant-envs", "crates/operant-python"]
 
 [workspace.package]
 version = "0.3.0"
 edition = "2021"
 license = "MIT"
 authors = ["goshea"]
+repository = "https://github.com/galenoshea/operant"
+homepage = "https://github.com/galenoshea/operant"
+keywords = ["reinforcement-learning", "rl", "simd", "gymnasium", "environments"]
+categories = ["science", "simulation", "game-development"]
 
 [workspace.dependencies]
 operant-core = { path = "crates/operant-core" }
@@ -15,3 +19,8 @@ rand = "0.8"
 rand_xoshiro = "0.6"
 pyo3 = { version = "0.27", features = ["extension-module"] }
 numpy = "0.27"
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = "0.28"
+sysinfo = "0.32"
+nvml-wrapper = "0.10"
+rayon = "1.10"

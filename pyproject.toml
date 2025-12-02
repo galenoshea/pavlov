@@ -35,7 +35,7 @@ Repository = "https://github.com/galenoshea/operant"
 [tool.maturin]
 manifest-path = "crates/operant-python/Cargo.toml"
 python-source = "python"
-features = ["pyo3/extension-module", "simd"]
+features = ["pyo3/extension-module", "simd", "parallel", "tui"]
 
 [tool.poetry.group.dev.dependencies]
 maturin = "^1.10.2"

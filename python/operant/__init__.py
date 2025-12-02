@@ -171,19 +171,19 @@ class _VecEnvWrapper:
 # Environment Factory Functions
 # =============================================================================
 
-def _create_cartpole_vec_env(num_envs: int = 1) -> _VecEnvWrapper:
+def _create_cartpole_vec_env(num_envs: int = 1, workers: int = 1) -> _VecEnvWrapper:
     """Create a vectorized CartPole environment."""
-    return _VecEnvWrapper(_rust_envs.PyCartPoleVecEnv(num_envs))
+    return _VecEnvWrapper(_rust_envs.PyCartPoleVecEnv(num_envs, workers=workers))
 
 
-def _create_mountaincar_vec_env(num_envs: int = 1) -> _VecEnvWrapper:
+def _create_mountaincar_vec_env(num_envs: int = 1, workers: int = 1) -> _VecEnvWrapper:
     """Create a vectorized MountainCar environment."""
-    return _VecEnvWrapper(_rust_envs.PyMountainCarVecEnv(num_envs))
+    return _VecEnvWrapper(_rust_envs.PyMountainCarVecEnv(num_envs, workers=workers))
 
 
-def _create_pendulum_vec_env(num_envs: int = 1) -> _VecEnvWrapper:
+def _create_pendulum_vec_env(num_envs: int = 1, workers: int = 1) -> _VecEnvWrapper:
     """Create a vectorized Pendulum environment."""
-    return _VecEnvWrapper(_rust_envs.PyPendulumVecEnv(num_envs))
+    return _VecEnvWrapper(_rust_envs.PyPendulumVecEnv(num_envs, workers=workers))
 
 
 # =============================================================================
@@ -197,19 +197,19 @@ class _EnvsModule:
         pass  # Lazy initialization
 
     @staticmethod
-    def CartPoleVecEnv(num_envs: int = 1) -> _VecEnvWrapper:
+    def CartPoleVecEnv(num_envs: int = 1, workers: int = 1) -> _VecEnvWrapper:
         """Create a vectorized CartPole environment."""
-        return _create_cartpole_vec_env(num_envs)
+        return _create_cartpole_vec_env(num_envs, workers=workers)
 
     @staticmethod
-    def MountainCarVecEnv(num_envs: int = 1) -> _VecEnvWrapper:
+    def MountainCarVecEnv(num_envs: int = 1, workers: int = 1) -> _VecEnvWrapper:
         """Create a vectorized MountainCar environment."""
-        return _create_mountaincar_vec_env(num_envs)
+        return _create_mountaincar_vec_env(num_envs, workers=workers)
 
     @staticmethod
-    def PendulumVecEnv(num_envs: int = 1) -> _VecEnvWrapper:
+    def PendulumVecEnv(num_envs: int = 1, workers: int = 1) -> _VecEnvWrapper:
         """Create a vectorized Pendulum environment."""
-        return _create_pendulum_vec_env(num_envs)
+        return _create_pendulum_vec_env(num_envs, workers=workers)
 
     def __dir__(self):
         return ["CartPoleVecEnv", "MountainCarVecEnv", "PendulumVecEnv"]
@@ -219,11 +219,22 @@ class _UtilsModule:
     """Utilities submodule."""
 
     def __init__(self):
-        from .logger import Logger
-        self.Logger = Logger
+        # Try to import TUILogger from Rust (requires tui feature)
+        try:
+            from .operant import TUILogger
+            self.TUILogger = TUILogger
+            self.Logger = TUILogger  # Backwards compatibility alias
+        except ImportError:
+            # Fall back to Python logger if tui feature not compiled
+            from .logger import Logger
+            self.Logger = Logger
+            self.TUILogger = None
 
     def __dir__(self):
-        return ["Logger"]
+        items = ["Logger"]
+        if self.TUILogger is not None:
+            items.append("TUILogger")
+        return items
 
 
 # Create submodule instances and register in sys.modules for proper import support
@@ -237,7 +248,14 @@ sys.modules['operant.utils'] = utils
 
 # Backwards compatibility - deprecated root-level imports
 from .operant import PyCartPoleVecEnv, PyMountainCarVecEnv, PyPendulumVecEnv
-from .logger import Logger
+
+# Import Logger - prefer TUILogger if available
+try:
+    from .operant import TUILogger
+    Logger = TUILogger
+except ImportError:
+    from .logger import Logger
+    TUILogger = None
 
 
 def _deprecated_import_warning(old_name: str, new_import: str) -> None:
@@ -274,10 +292,12 @@ __all__ = [
     # Space classes for type hints
     "BoxSpace",
     "DiscreteSpace",
+    # TUI Logger (primary)
+    "TUILogger",
+    "Logger",  # Alias for TUILogger
     # Deprecated - for backwards compatibility only
     "PyCartPoleVecEnv",
     "PyMountainCarVecEnv",
     "PyPendulumVecEnv",
-    "Logger",
 ]
 __version__ = "0.3.2"

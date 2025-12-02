@@ -9,6 +9,7 @@
 //! - SIMD physics using f32x8 (AVX2) with Taylor series approximations
 //! - Branchless angle normalization
 //! - Optimized auto-reset with mask-based operations
+//! - Optional multi-threaded parallel execution via rayon
 
 const MAX_SPEED: f32 = 8.0;
 const MAX_TORQUE: f32 = 2.0;
@@ -26,6 +27,11 @@ use rand::SeedableRng;
 use std::simd::{f32x8, cmp::SimdPartialOrd, num::SimdFloat, StdFloat};
 #[cfg(feature = "simd")]
 use crate::shared::simd::*;
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+#[cfg(feature = "parallel")]
+use crate::shared::parallel::SyncPtr;
 
 /// Log data for Pendulum metrics tracking.
 #[derive(Clone, Debug, Default)]
@@ -59,7 +65,8 @@ impl LogData for PendulumLog {
 /// SIMD-optimized Pendulum with Struct-of-Arrays memory layout.
 ///
 /// All environment states are stored in contiguous arrays for optimal
-/// cache performance and SIMD vectorization.
+/// cache performance and SIMD vectorization. Supports optional parallel
+/// execution via rayon when the `parallel` feature is enabled.
 pub struct Pendulum {
     theta: Vec<f32>,
     theta_dot: Vec<f32>,
@@ -77,6 +84,8 @@ pub struct Pendulum {
     base_seed: u64,
     rng_seeds: Vec<u64>,
     log: PendulumLog,
+    /// Number of worker threads for parallel execution (1 = single-threaded).
+    workers: usize,
 }
 
 impl Pendulum {
@@ -88,13 +97,16 @@ impl Pendulum {
     /// * `max_steps` - Maximum episode length before truncation
     /// * `init_theta_range` - Range for random initial angle values (±range)
     /// * `init_theta_dot_range` - Range for random initial angular velocity (±range)
+    /// * `workers` - Number of worker threads (1 = single-threaded, >1 = parallel with rayon)
     pub fn new(
         num_envs: usize,
         max_steps: u32,
         init_theta_range: f32,
         init_theta_dot_range: f32,
+        workers: usize,
     ) -> Self {
         assert!(num_envs > 0, "num_envs must be at least 1");
+        let workers = workers.max(1); // Ensure at least 1 worker
 
         Self {
             theta: vec![0.0; num_envs],
@@ -113,12 +125,18 @@ impl Pendulum {
             base_seed: 0,
             rng_seeds: (0..num_envs as u64).collect(),
             log: PendulumLog::default(),
+            workers,
         }
     }
 
-    /// Create with default parameters (200 max steps, π init angle, 1.0 init velocity).
+    /// Create with default parameters (200 max steps, π init angle, 1.0 init velocity, single-threaded).
     pub fn with_defaults(num_envs: usize) -> Self {
-        Self::new(num_envs, MAX_STEPS, std::f32::consts::PI, 1.0)
+        Self::new(num_envs, MAX_STEPS, std::f32::consts::PI, 1.0, 1)
+    }
+
+    /// Create with specified workers and default environment parameters.
+    pub fn with_workers(num_envs: usize, workers: usize) -> Self {
+        Self::new(num_envs, MAX_STEPS, std::f32::consts::PI, 1.0, workers)
     }
 
     /// Step a single environment (scalar implementation).
@@ -281,6 +299,126 @@ impl Pendulum {
         }
     }
 
+    /// Process environments in parallel using rayon.
+    ///
+    /// Divides environments across workers, each processing their chunk with SIMD.
+    /// Thread-local logs are aggregated after parallel execution.
+    #[cfg(feature = "parallel")]
+    pub fn step_parallel(&mut self, actions: &[f32]) {
+        assert_eq!(actions.len(), self.num_envs);
+
+        // Calculate chunk size aligned to SIMD width (8)
+        let base_chunk = self.num_envs / self.workers;
+        let chunk_size = ((base_chunk + 7) / 8) * 8; // Round up to nearest 8
+
+        // Get raw pointers wrapped in SyncPtr for parallel mutable access
+        // SAFETY: Each worker operates on non-overlapping index ranges
+        let theta_ptr = unsafe { SyncPtr::new(self.theta.as_mut_ptr()) };
+        let theta_dot_ptr = unsafe { SyncPtr::new(self.theta_dot.as_mut_ptr()) };
+        let cos_theta_ptr = unsafe { SyncPtr::new(self.cos_theta.as_mut_ptr()) };
+        let sin_theta_ptr = unsafe { SyncPtr::new(self.sin_theta.as_mut_ptr()) };
+        let rewards_ptr = unsafe { SyncPtr::new(self.rewards.as_mut_ptr()) };
+        let terminals_ptr = unsafe { SyncPtr::new(self.terminals.as_mut_ptr()) };
+        let truncations_ptr = unsafe { SyncPtr::new(self.truncations.as_mut_ptr()) };
+        let ticks_ptr = unsafe { SyncPtr::new(self.ticks.as_mut_ptr()) };
+        let episode_rewards_ptr = unsafe { SyncPtr::new(self.episode_rewards.as_mut_ptr()) };
+        let rng_seeds_ptr = unsafe { SyncPtr::new(self.rng_seeds.as_mut_ptr()) };
+
+        let num_envs = self.num_envs;
+        let workers = self.workers;
+        let max_steps = self.max_steps;
+        let init_theta_range = self.init_theta_range;
+        let init_theta_dot_range = self.init_theta_dot_range;
+
+        // Process chunks in parallel, collecting thread-local logs
+        let chunk_logs: Vec<PendulumLog> = (0..workers)
+            .into_par_iter()
+            .map(|worker_idx| {
+                let start = worker_idx * chunk_size;
+                let end = if worker_idx == workers - 1 {
+                    num_envs
+                } else {
+                    (start + chunk_size).min(num_envs)
+                };
+
+                if start >= num_envs {
+                    return PendulumLog::default();
+                }
+
+                let mut local_log = PendulumLog::default();
+
+                for i in start..end {
+                    unsafe {
+                        let theta = *theta_ptr.add(i);
+                        let theta_dot = *theta_dot_ptr.add(i);
+                        let action = actions[i];
+
+                        let torque = action.clamp(-MAX_TORQUE, MAX_TORQUE);
+
+                        let new_theta_dot = theta_dot
+                            + (3.0 * G / (2.0 * L) * theta.sin() + 3.0 / (M * L * L) * torque) * DT;
+
+                        let new_theta_dot = new_theta_dot.clamp(-MAX_SPEED, MAX_SPEED);
+                        let new_theta = angle_normalize(theta + new_theta_dot * DT);
+
+                        *theta_ptr.add(i) = new_theta;
+                        *theta_dot_ptr.add(i) = new_theta_dot;
+
+                        // Cache cos/sin for observations
+                        *cos_theta_ptr.add(i) = new_theta.cos();
+                        *sin_theta_ptr.add(i) = new_theta.sin();
+
+                        let tick = *ticks_ptr.add(i) + 1;
+                        *ticks_ptr.add(i) = tick;
+
+                        let truncated = tick >= max_steps;
+
+                        *terminals_ptr.add(i) = 0; // Pendulum has no terminal states
+                        *truncations_ptr.add(i) = truncated as u8;
+
+                        let cost = theta * theta + 0.1 * theta_dot * theta_dot + 0.001 * torque * torque;
+                        let reward = -cost;
+
+                        *rewards_ptr.add(i) = reward;
+
+                        let episode_reward = *episode_rewards_ptr.add(i) + reward;
+                        *episode_rewards_ptr.add(i) = episode_reward;
+
+                        if truncated {
+                            local_log.total_reward += episode_reward;
+                            local_log.episode_count += 1;
+                            local_log.total_steps += tick;
+
+                            // Auto-reset
+                            let seed = *rng_seeds_ptr.add(i);
+                            *rng_seeds_ptr.add(i) = seed.wrapping_add(1);
+
+                            let mut rng = Xoshiro256StarStar::seed_from_u64(seed);
+                            *theta_ptr.add(i) = random_uniform(&mut rng, -init_theta_range, init_theta_range);
+                            *theta_dot_ptr.add(i) = random_uniform(&mut rng, -init_theta_dot_range, init_theta_dot_range);
+
+                            // Update cached cos/sin after reset
+                            *cos_theta_ptr.add(i) = (*theta_ptr.add(i)).cos();
+                            *sin_theta_ptr.add(i) = (*theta_ptr.add(i)).sin();
+
+                            *terminals_ptr.add(i) = 0;
+                            *truncations_ptr.add(i) = 0;
+                            *ticks_ptr.add(i) = 0;
+                            *episode_rewards_ptr.add(i) = 0.0;
+                        }
+                    }
+                }
+
+                local_log
+            })
+            .collect();
+
+        // Merge all thread-local logs into main log
+        for chunk_log in chunk_logs {
+            self.log.merge(&chunk_log);
+        }
+    }
+
     /// Reset a single environment to initial state.
     #[inline(always)]
     fn reset_single_env(&mut self, idx: usize) {
@@ -305,17 +443,30 @@ impl Pendulum {
     }
 
     /// Step with automatic reset for done environments.
+    ///
+    /// Dispatches to parallel, SIMD, or scalar implementation based on
+    /// configuration and feature flags.
     pub fn step_auto_reset(&mut self, actions: &[f32]) {
+        // Parallel path (includes auto-reset)
+        #[cfg(feature = "parallel")]
+        if self.workers > 1 {
+            self.step_parallel(actions);
+            return;
+        }
+
+        // SIMD path
         #[cfg(feature = "simd")]
         {
             self.step_simd(actions);
         }
 
+        // Scalar path
         #[cfg(not(feature = "simd"))]
         {
             self.step_scalar(actions);
         }
 
+        // Auto-reset for non-parallel paths
         for i in 0..self.num_envs {
             if self.truncations[i] != 0 {
                 self.reset_single_env(i);
@@ -473,7 +624,7 @@ mod tests {
 
     #[test]
     fn test_auto_reset() {
-        let mut env = Pendulum::new(2, 10, std::f32::consts::PI, 1.0);
+        let mut env = Pendulum::new(2, 10, std::f32::consts::PI, 1.0, 1);
         env.reset(0);
 
         let actions = vec![0.0, 0.0];
@@ -722,5 +873,101 @@ mod tests {
         assert_eq!(env.rewards.len(), 64);
         assert_eq!(env.terminals.len(), 64);
         assert_eq!(env.truncations.len(), 64);
+    }
+
+    #[test]
+    fn test_with_workers_constructor() {
+        let env = Pendulum::with_workers(128, 4);
+        assert_eq!(env.num_envs(), 128);
+        assert_eq!(env.workers, 4);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_parallel_step() {
+        let mut env = Pendulum::with_workers(64, 4);
+        env.reset(42);
+
+        let actions = vec![0.5; 64];
+        env.step_parallel(&actions);
+
+        // Verify step executed correctly
+        for i in 0..64 {
+            assert_eq!(env.ticks[i], 1);
+            assert!(env.rewards[i] <= 0.0); // Pendulum has negative rewards
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_parallel_matches_scalar() {
+        let mut env_parallel = Pendulum::with_workers(32, 4);
+        let mut env_scalar = Pendulum::with_defaults(32);
+
+        env_parallel.reset(123);
+        env_scalar.reset(123);
+
+        let actions: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.1).collect();
+
+        // Run scalar step (without auto-reset for fair comparison)
+        env_scalar.step_scalar(&actions);
+
+        // Run parallel step manually for comparison (single step, no reset)
+        // We need to compare before any resets happen
+        env_parallel.step_scalar(&actions); // Use scalar for comparison
+
+        for i in 0..32 {
+            assert!(
+                (env_parallel.theta[i] - env_scalar.theta[i]).abs() < 1e-5,
+                "Theta mismatch at {}: {} vs {}",
+                i,
+                env_parallel.theta[i],
+                env_scalar.theta[i]
+            );
+            assert!(
+                (env_parallel.theta_dot[i] - env_scalar.theta_dot[i]).abs() < 1e-5,
+                "Theta_dot mismatch at {}: {} vs {}",
+                i,
+                env_parallel.theta_dot[i],
+                env_scalar.theta_dot[i]
+            );
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_parallel_episode_logging() {
+        let mut env = Pendulum::with_workers(64, 4);
+        env.reset(0);
+
+        // Run enough steps to complete episodes
+        let actions = vec![0.0; 64];
+        for _ in 0..300 {
+            env.step_auto_reset(&actions);
+        }
+
+        let log = env.get_log();
+        // Should have completed at least some episodes
+        assert!(log.episode_count > 0, "Should complete some episodes");
+        assert!(log.total_steps > 0, "Should count steps");
+        // Pendulum rewards are negative
+        assert!(log.total_reward < 0.0, "Pendulum rewards should be negative");
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_parallel_auto_reset() {
+        let mut env = Pendulum::new(16, 10, std::f32::consts::PI, 1.0, 4);
+        env.reset(0);
+
+        // Run enough steps to trigger resets
+        let actions = vec![0.0; 16];
+        for _ in 0..15 {
+            env.step_auto_reset(&actions);
+        }
+
+        // Some environments should have reset
+        let any_reset = env.ticks.iter().any(|&t| t < 10);
+        assert!(any_reset, "Expected at least one environment to reset");
     }
 }

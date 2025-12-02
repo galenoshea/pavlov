@@ -28,6 +28,11 @@ use std::simd::{f32x8, cmp::SimdPartialOrd};
 #[cfg(feature = "simd")]
 use crate::shared::simd::*;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+#[cfg(feature = "parallel")]
+use crate::shared::parallel::SyncPtr;
+
 /// Log data for CartPole metrics tracking.
 #[derive(Clone, Debug, Default)]
 pub struct CartPoleLog {
@@ -77,6 +82,8 @@ pub struct CartPole {
     base_seed: u64,
     rng_seeds: Vec<u64>,
     log: CartPoleLog,
+    /// Number of worker threads (1 = single-threaded, >1 = parallel).
+    workers: usize,
 }
 
 impl CartPole {
@@ -87,8 +94,10 @@ impl CartPole {
     /// * `num_envs` - Number of parallel environment instances
     /// * `max_steps` - Maximum episode length before truncation
     /// * `init_range` - Range for random initial state values
-    pub fn new(num_envs: usize, max_steps: u32, init_range: f32) -> Self {
+    /// * `workers` - Number of worker threads (1 = single-threaded, >1 = parallel)
+    pub fn new(num_envs: usize, max_steps: u32, init_range: f32, workers: usize) -> Self {
         assert!(num_envs > 0, "num_envs must be at least 1");
+        let workers = workers.max(1);
 
         Self {
             x: vec![0.0; num_envs],
@@ -106,12 +115,24 @@ impl CartPole {
             base_seed: 0,
             rng_seeds: (0..num_envs as u64).collect(),
             log: CartPoleLog::default(),
+            workers,
         }
     }
 
-    /// Create with default CartPole configuration.
+    /// Create with default CartPole configuration (single-threaded).
     pub fn with_defaults(num_envs: usize) -> Self {
-        Self::new(num_envs, MAX_STEPS, 0.05)
+        Self::new(num_envs, MAX_STEPS, 0.05, 1)
+    }
+
+    /// Create with default CartPole configuration and specified worker count.
+    pub fn with_workers(num_envs: usize, workers: usize) -> Self {
+        Self::new(num_envs, MAX_STEPS, 0.05, workers)
+    }
+
+    /// Get the number of workers.
+    #[inline]
+    pub fn workers(&self) -> usize {
+        self.workers
     }
 
     /// Get the number of environments.
@@ -369,13 +390,152 @@ impl CartPole {
         }
     }
 
-    /// Step using the best available method (SIMD if enabled, scalar otherwise).
+    /// Step all environments in parallel across worker threads.
+    ///
+    /// Each worker processes a chunk of environments using SIMD (if enabled).
+    /// Thread-local logs are merged after parallel processing.
+    #[cfg(feature = "parallel")]
+    pub fn step_parallel(&mut self, actions: &[f32]) {
+        debug_assert_eq!(actions.len(), self.num_envs);
+
+        let num_envs = self.num_envs;
+        let workers = self.workers;
+        let max_steps = self.max_steps;
+
+        // Calculate chunk size, aligned to SIMD lanes (8) for efficiency
+        let base_chunk_size = num_envs / workers;
+        let chunk_size = (base_chunk_size / 8) * 8;
+        let chunk_size = chunk_size.max(8); // Minimum chunk size of 8
+
+        // Get raw pointers wrapped in SyncPtr for parallel mutable access
+        // SAFETY: Each worker operates on non-overlapping index ranges
+        let x_ptr = unsafe { SyncPtr::new(self.x.as_mut_ptr()) };
+        let x_dot_ptr = unsafe { SyncPtr::new(self.x_dot.as_mut_ptr()) };
+        let theta_ptr = unsafe { SyncPtr::new(self.theta.as_mut_ptr()) };
+        let theta_dot_ptr = unsafe { SyncPtr::new(self.theta_dot.as_mut_ptr()) };
+        let rewards_ptr = unsafe { SyncPtr::new(self.rewards.as_mut_ptr()) };
+        let terminals_ptr = unsafe { SyncPtr::new(self.terminals.as_mut_ptr()) };
+        let truncations_ptr = unsafe { SyncPtr::new(self.truncations.as_mut_ptr()) };
+        let ticks_ptr = unsafe { SyncPtr::new(self.ticks.as_mut_ptr()) };
+        let episode_rewards_ptr = unsafe { SyncPtr::new(self.episode_rewards.as_mut_ptr()) };
+
+        // Process chunks in parallel, collect logs
+        let chunk_logs: Vec<CartPoleLog> = (0..workers)
+            .into_par_iter()
+            .map(|worker_idx| {
+                let start = worker_idx * chunk_size;
+                let end = if worker_idx == workers - 1 {
+                    num_envs
+                } else {
+                    (start + chunk_size).min(num_envs)
+                };
+
+                if start >= num_envs {
+                    return CartPoleLog::default();
+                }
+
+                let mut local_log = CartPoleLog::default();
+
+                for i in start..end {
+                    // SAFETY: Each worker has exclusive access to indices [start..end)
+                    unsafe {
+                        let action = *actions.get_unchecked(i);
+                        let force = if action as i32 == 1 { FORCE_MAG } else { -FORCE_MAG };
+
+                        let x = *x_ptr.add(i);
+                        let x_dot = *x_dot_ptr.add(i);
+                        let theta = *theta_ptr.add(i);
+                        let theta_dot = *theta_dot_ptr.add(i);
+
+                        let cos_theta = theta.cos();
+                        let sin_theta = theta.sin();
+
+                        let total_mass = CART_MASS + POLE_MASS;
+                        let pole_mass_length = POLE_MASS * POLE_LENGTH;
+
+                        let temp = (force + pole_mass_length * theta_dot * theta_dot * sin_theta)
+                            / total_mass;
+
+                        let theta_acc = (GRAVITY * sin_theta - cos_theta * temp)
+                            / (POLE_LENGTH
+                                * (4.0 / 3.0 - POLE_MASS * cos_theta * cos_theta / total_mass));
+
+                        let x_acc = temp - pole_mass_length * theta_acc * cos_theta / total_mass;
+
+                        let new_x = x + DT * x_dot;
+                        let new_x_dot = x_dot + DT * x_acc;
+                        let new_theta = theta + DT * theta_dot;
+                        let new_theta_dot = theta_dot + DT * theta_acc;
+
+                        *x_ptr.add(i) = new_x;
+                        *x_dot_ptr.add(i) = new_x_dot;
+                        *theta_ptr.add(i) = new_theta;
+                        *theta_dot_ptr.add(i) = new_theta_dot;
+
+                        let tick = *ticks_ptr.add(i) + 1;
+                        *ticks_ptr.add(i) = tick;
+
+                        let terminal =
+                            (new_x.abs() > X_THRESHOLD) | (new_theta.abs() > THETA_THRESHOLD);
+                        let truncated = tick >= max_steps;
+
+                        *terminals_ptr.add(i) = terminal as u8;
+                        *truncations_ptr.add(i) = truncated as u8;
+
+                        let reward = if terminal { 0.0 } else { 1.0 };
+                        *rewards_ptr.add(i) = reward;
+
+                        let episode_reward = *episode_rewards_ptr.add(i) + reward;
+                        *episode_rewards_ptr.add(i) = episode_reward;
+
+                        if terminal || truncated {
+                            local_log.total_reward += episode_reward;
+                            local_log.episode_count += 1;
+                            local_log.total_steps += tick;
+                        }
+                    }
+                }
+
+                local_log
+            })
+            .collect();
+
+        // Merge logs from all workers
+        for log in chunk_logs {
+            self.log.merge(&log);
+        }
+    }
+
+    /// Step all environments with auto-reset using parallel workers.
+    #[cfg(feature = "parallel")]
+    pub fn step_auto_reset_parallel(&mut self, actions: &[f32]) {
+        self.step_parallel(actions);
+
+        for i in 0..self.num_envs {
+            if self.terminals[i] != 0 || self.truncations[i] != 0 {
+                let new_seed = self.rng_seeds[i].wrapping_add(self.num_envs as u64);
+                self.reset_single(i, new_seed);
+            }
+        }
+    }
+
+    /// Step using the best available method based on configuration.
+    ///
+    /// Priority: parallel (if workers > 1) > SIMD > scalar
     #[inline]
     pub fn step(&mut self, actions: &[f32]) {
+        #[cfg(feature = "parallel")]
+        if self.workers > 1 {
+            self.step_parallel(actions);
+            return;
+        }
+
         #[cfg(feature = "simd")]
         {
             self.step_simd(actions);
+            return;
         }
+
         #[cfg(not(feature = "simd"))]
         {
             self.step_scalar(actions);
@@ -383,12 +543,22 @@ impl CartPole {
     }
 
     /// Step with auto-reset using the best available method.
+    ///
+    /// Priority: parallel (if workers > 1) > SIMD > scalar
     #[inline]
     pub fn step_auto_reset(&mut self, actions: &[f32]) {
+        #[cfg(feature = "parallel")]
+        if self.workers > 1 {
+            self.step_auto_reset_parallel(actions);
+            return;
+        }
+
         #[cfg(feature = "simd")]
         {
             self.step_auto_reset_simd(actions);
+            return;
         }
+
         #[cfg(not(feature = "simd"))]
         {
             self.step_auto_reset_scalar(actions);
@@ -520,7 +690,7 @@ mod tests {
 
     #[test]
     fn test_cartpole_auto_reset() {
-        let mut env = CartPole::new(2, 10, 0.05);
+        let mut env = CartPole::new(2, 10, 0.05, 1);
         env.reset(0);
 
         let actions = vec![1.0, 1.0];
@@ -738,5 +908,83 @@ mod tests {
         assert_eq!(env.rewards.len(), 64);
         assert_eq!(env.terminals.len(), 64);
         assert_eq!(env.truncations.len(), 64);
+    }
+
+    #[test]
+    fn test_with_workers() {
+        let env = CartPole::with_workers(1024, 4);
+        assert_eq!(env.num_envs(), 1024);
+        assert_eq!(env.workers(), 4);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_parallel_matches_scalar() {
+        let mut scalar_env = CartPole::with_defaults(64);
+        let mut parallel_env = CartPole::with_workers(64, 4);
+
+        scalar_env.reset(123);
+        parallel_env.reset(123);
+
+        let actions: Vec<f32> = (0..64).map(|i| (i % 2) as f32).collect();
+
+        scalar_env.step_scalar(&actions);
+        parallel_env.step_parallel(&actions);
+
+        for i in 0..64 {
+            assert!(
+                (scalar_env.x[i] - parallel_env.x[i]).abs() < 1e-5,
+                "x mismatch at {}: {} vs {}",
+                i,
+                scalar_env.x[i],
+                parallel_env.x[i]
+            );
+            assert!(
+                (scalar_env.theta[i] - parallel_env.theta[i]).abs() < 1e-5,
+                "theta mismatch at {}: {} vs {}",
+                i,
+                scalar_env.theta[i],
+                parallel_env.theta[i]
+            );
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_parallel_auto_reset() {
+        let mut env = CartPole::with_workers(32, 4);
+        env.reset(0);
+
+        let actions: Vec<f32> = vec![0.0; 32];
+        for _ in 0..100 {
+            env.step_auto_reset(&actions);
+        }
+
+        let log = env.get_log();
+        assert!(log.episode_count > 0, "Should complete some episodes");
+        assert!(log.total_reward > 0.0, "Should accumulate some reward");
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_parallel_deterministic() {
+        let mut env1 = CartPole::with_workers(128, 4);
+        let mut env2 = CartPole::with_workers(128, 4);
+
+        env1.reset(42);
+        env2.reset(42);
+
+        let actions: Vec<f32> = (0..128).map(|i| (i % 2) as f32).collect();
+
+        for _ in 0..10 {
+            env1.step_auto_reset(&actions);
+            env2.step_auto_reset(&actions);
+        }
+
+        // Same seed + same workers should produce identical results
+        for i in 0..128 {
+            assert_eq!(env1.x[i], env2.x[i], "x should match at index {}", i);
+            assert_eq!(env1.theta[i], env2.theta[i], "theta should match at index {}", i);
+        }
     }
 }

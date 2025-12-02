@@ -4,8 +4,10 @@ This benchmark measures steps per second (SPS) for vectorized environments
 at various parallelization levels.
 
 Usage:
-    python benches/cartpole_benchmark.py          # Quick Operant benchmark (4096 envs)
-    python benches/cartpole_benchmark.py --all    # Full benchmark suite (Gymnasium vs Operant)
+    python benches/cartpole_benchmark.py                    # Quick Operant benchmark (4096 envs)
+    python benches/cartpole_benchmark.py --fast             # Operant only (alias for default)
+    python benches/cartpole_benchmark.py --fast --envs 8192 # Operant only with custom env count
+    python benches/cartpole_benchmark.py --all              # Full benchmark suite (Gymnasium vs Operant)
 """
 
 import argparse
@@ -57,27 +59,27 @@ def benchmark_gymnasium(num_envs: int, num_steps: int, num_trials: int = 5) -> d
 
 
 
-def benchmark_operant(num_envs: int, num_steps: int, num_trials: int = 5) -> dict:
+def benchmark_operant(num_envs: int, num_steps: int, num_trials: int = 5, workers: int = 1) -> dict:
     """Benchmark Operant Rust CartPole."""
     results = []
 
     for trial in range(num_trials):
-        # Create vectorized environment
-        env = CartPoleVecEnv(num_envs)
+        # Create vectorized environment (with optional parallel workers)
+        env = CartPoleVecEnv(num_envs, workers=workers)
 
         # Reset
-        obs = env.reset(seed=42 + trial)
+        obs, _ = env.reset(seed=42 + trial)
 
         # Warmup
         for _ in range(100):
             actions = np.random.randint(0, 2, num_envs, dtype=np.int32)
-            obs, rewards, terminals, truncations = env.step(actions)
+            obs, rewards, terminals, truncations, _ = env.step(actions)
 
         # Benchmark
         start = time.perf_counter()
         for _ in range(num_steps):
             actions = np.random.randint(0, 2, num_envs, dtype=np.int32)
-            obs, rewards, terminals, truncations = env.step(actions)
+            obs, rewards, terminals, truncations, _ = env.step(actions)
         elapsed = time.perf_counter() - start
 
         total_steps = num_steps * num_envs
@@ -165,25 +167,48 @@ def run_benchmark():
     return all_results
 
 
-def run_fast_benchmark():
-    """Quick benchmark at 4096 envs for Operant only."""
-    num_envs = 4096
+def run_fast_benchmark(num_envs: int = 4096):
+    """Quick benchmark for Operant only, testing parallelization."""
+    import os
     num_steps = 2000
     num_trials = 3
 
+    # Get number of CPU cores for testing
+    cpu_count = os.cpu_count() or 4
+
     print("=" * 60)
-    print("CartPole Benchmark - Operant (4096 envs)")
+    print(f"CartPole Benchmark - Operant ({num_envs} envs)")
     print("=" * 60)
     print()
 
-    # Operant
-    print("Operant...     ", end="", flush=True)
-    op_results = benchmark_operant(num_envs, num_steps, num_trials)
-    print(f"{op_results['mean_sps']/1e6:>6.2f}M steps/sec")
+    # Test different worker counts
+    worker_configs = [1, 2, 4, cpu_count]
+    # Remove duplicates and sort
+    worker_configs = sorted(set(worker_configs))
+
+    results = {}
+
+    for workers in worker_configs:
+        label = f"workers={workers}"
+        print(f"Operant ({label})...  ", end="", flush=True)
+        op_results = benchmark_operant(num_envs, num_steps, num_trials, workers=workers)
+        results[workers] = op_results
+        print(f"{op_results['mean_sps']/1e6:>6.2f}M steps/sec")
 
     print()
-    print(f"Total steps: {num_steps * num_envs * num_trials:,}")
+    print("-" * 60)
+
+    # Calculate speedups relative to single-threaded
+    baseline = results[1]['mean_sps']
+    for workers in worker_configs:
+        if workers > 1:
+            speedup = results[workers]['mean_sps'] / baseline
+            print(f"Speedup with {workers} workers: {speedup:.2f}x")
+
+    print()
+    print(f"Total steps per config: {num_steps * num_envs * num_trials:,}")
     print(f"Trials: {num_trials}")
+    print(f"CPU cores: {cpu_count}")
     print("=" * 60)
 
 
@@ -191,9 +216,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='CartPole benchmark')
     parser.add_argument('--all', action='store_true',
                         help='Full benchmark suite at multiple environment counts')
+    parser.add_argument('--fast', action='store_true',
+                        help='Operant-only benchmark (default behavior)')
+    parser.add_argument('--envs', type=int, default=4096,
+                        help='Number of environments for --fast benchmark (default: 4096)')
     args = parser.parse_args()
 
     if args.all:
         run_benchmark()
     else:
-        run_fast_benchmark()
+        run_fast_benchmark(num_envs=args.envs)
