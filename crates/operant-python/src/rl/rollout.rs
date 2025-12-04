@@ -1,6 +1,6 @@
 //! High-performance rollout buffer with GAE computation.
 
-use numpy::{PyArray1, PyArray2, PyArrayMethods, ToPyArray};
+use numpy::{PyArray1, PyArray2, PyArray3, PyArrayMethods, ToPyArray};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -139,6 +139,76 @@ impl RolloutBuffer {
         Ok(())
     }
 
+    /// Add a batch of transitions (entire rollout at once).
+    ///
+    /// This is more efficient than calling add() repeatedly as it minimizes FFI overhead.
+    ///
+    /// # Arguments
+    /// * `observations` - Shape (num_steps, num_envs, obs_dim)
+    /// * `actions` - Shape (num_steps, num_envs) for discrete, (num_steps, num_envs, act_dim) for continuous
+    /// * `rewards` - Shape (num_steps, num_envs)
+    /// * `dones` - Shape (num_steps, num_envs)
+    /// * `values` - Shape (num_steps, num_envs)
+    /// * `log_probs` - Shape (num_steps, num_envs)
+    pub fn add_batch<'py>(
+        &mut self,
+        observations: &Bound<'py, PyArray3<f32>>,
+        actions: &Bound<'py, PyArray2<f32>>,
+        rewards: &Bound<'py, PyArray2<f32>>,
+        dones: &Bound<'py, PyArray2<f32>>,
+        values: &Bound<'py, PyArray2<f32>>,
+        log_probs: &Bound<'py, PyArray2<f32>>,
+    ) -> PyResult<()> {
+        // Validate shapes
+        let obs_dims = observations.dims();
+        if obs_dims[0] != self.num_steps || obs_dims[1] != self.num_envs || obs_dims[2] != self.obs_dim {
+            return Err(PyValueError::new_err(format!(
+                "Expected observations shape ({}, {}, {}), got ({}, {}, {})",
+                self.num_steps, self.num_envs, self.obs_dim,
+                obs_dims[0], obs_dims[1], obs_dims[2]
+            )));
+        }
+
+        let act_dims = actions.dims();
+        let expected_act_shape = if self.is_continuous {
+            (self.num_steps, self.num_envs * self.act_dim)
+        } else {
+            (self.num_steps, self.num_envs)
+        };
+        if act_dims[0] != expected_act_shape.0 || act_dims[1] != expected_act_shape.1 {
+            return Err(PyValueError::new_err(format!(
+                "Expected actions shape {:?}, got ({}, {})",
+                expected_act_shape, act_dims[0], act_dims[1]
+            )));
+        }
+
+        // Copy all data at once (contiguous memory operations)
+        unsafe {
+            let obs_slice = observations.as_slice()?;
+            self.observations.copy_from_slice(obs_slice);
+
+            let act_slice = actions.as_slice()?;
+            self.actions[..act_slice.len()].copy_from_slice(act_slice);
+
+            let rew_slice = rewards.as_slice()?;
+            self.rewards.copy_from_slice(rew_slice);
+
+            let done_slice = dones.as_slice()?;
+            self.dones.copy_from_slice(done_slice);
+
+            let val_slice = values.as_slice()?;
+            self.values.copy_from_slice(val_slice);
+
+            let logp_slice = log_probs.as_slice()?;
+            self.log_probs.copy_from_slice(logp_slice);
+        }
+
+        self.step = self.num_steps;
+        self.full = true;
+
+        Ok(())
+    }
+
     /// Compute GAE advantages and returns.
     ///
     /// # Arguments
@@ -160,30 +230,28 @@ impl RolloutBuffer {
         for t in (0..self.num_steps).rev() {
             let step_idx = t * self.num_envs;
 
-            for e in 0..self.num_envs {
-                let idx = step_idx + e;
+            #[cfg(feature = "simd")]
+            {
+                self.compute_gae_step_simd(step_idx, t, last_vals, &mut last_gae, gamma, gae_lambda);
+            }
 
-                // Get next value and non-terminal mask
-                let (next_value, next_non_terminal) = if t == self.num_steps - 1 {
-                    (last_vals[e], 1.0 - self.dones[idx])
-                } else {
-                    let next_idx = (t + 1) * self.num_envs + e;
-                    (self.values[next_idx], 1.0 - self.dones[next_idx])
-                };
-
-                // TD error
-                let delta =
-                    self.rewards[idx] + gamma * next_value * next_non_terminal - self.values[idx];
-
-                // GAE
-                last_gae[e] = delta + gamma * gae_lambda * next_non_terminal * last_gae[e];
-                self.advantages[idx] = last_gae[e];
+            #[cfg(not(feature = "simd"))]
+            {
+                self.compute_gae_step_scalar(step_idx, t, last_vals, &mut last_gae, gamma, gae_lambda);
             }
         }
 
         // Compute returns = advantages + values
-        for i in 0..self.advantages.len() {
-            self.returns[i] = self.advantages[i] + self.values[i];
+        #[cfg(feature = "simd")]
+        {
+            self.compute_returns_simd();
+        }
+
+        #[cfg(not(feature = "simd"))]
+        {
+            for i in 0..self.advantages.len() {
+                self.returns[i] = self.advantages[i] + self.values[i];
+            }
         }
 
         Ok(())
@@ -261,5 +329,137 @@ impl RolloutBuffer {
     #[getter]
     pub fn obs_dim(&self) -> usize {
         self.obs_dim
+    }
+}
+
+// Helper methods for GAE computation (outside #[pymethods] block)
+impl RolloutBuffer {
+    /// Scalar GAE computation for one step (fallback or non-SIMD builds).
+    #[inline(always)]
+    fn compute_gae_step_scalar(
+        &mut self,
+        step_idx: usize,
+        t: usize,
+        last_vals: &[f32],
+        last_gae: &mut [f32],
+        gamma: f32,
+        gae_lambda: f32,
+    ) {
+        for e in 0..self.num_envs {
+            let idx = step_idx + e;
+
+            // Get next value and non-terminal mask
+            let (next_value, next_non_terminal) = if t == self.num_steps - 1 {
+                (last_vals[e], 1.0 - self.dones[idx])
+            } else {
+                let next_idx = (t + 1) * self.num_envs + e;
+                (self.values[next_idx], 1.0 - self.dones[next_idx])
+            };
+
+            // TD error
+            let delta = self.rewards[idx] + gamma * next_value * next_non_terminal - self.values[idx];
+
+            // GAE
+            last_gae[e] = delta + gamma * gae_lambda * next_non_terminal * last_gae[e];
+            self.advantages[idx] = last_gae[e];
+        }
+    }
+
+    /// SIMD GAE computation for one step (processes 8 envs at a time).
+    #[cfg(feature = "simd")]
+    #[inline(always)]
+    fn compute_gae_step_simd(
+        &mut self,
+        step_idx: usize,
+        t: usize,
+        last_vals: &[f32],
+        last_gae: &mut [f32],
+        gamma: f32,
+        gae_lambda: f32,
+    ) {
+        use std::simd::{f32x8, num::SimdFloat};
+
+        const LANES: usize = 8;
+        let gamma_vec = f32x8::splat(gamma);
+        let gae_lambda_vec = f32x8::splat(gae_lambda);
+        let one_vec = f32x8::splat(1.0);
+
+        // Process chunks of 8 environments
+        for chunk in (0..self.num_envs).step_by(LANES) {
+            if chunk + LANES <= self.num_envs {
+                // SIMD path: process 8 environments in parallel
+                let idx = step_idx + chunk;
+
+                // Load current step data
+                let rewards_vec = f32x8::from_slice(&self.rewards[idx..]);
+                let values_vec = f32x8::from_slice(&self.values[idx..]);
+                let last_gae_vec = f32x8::from_slice(&last_gae[chunk..]);
+
+                // Get next values and non-terminal masks
+                let (next_value, next_non_terminal) = if t == self.num_steps - 1 {
+                    let next_val = f32x8::from_slice(&last_vals[chunk..]);
+                    let dones = f32x8::from_slice(&self.dones[idx..]);
+                    let non_term = one_vec - dones;
+                    (next_val, non_term)
+                } else {
+                    let next_idx = (t + 1) * self.num_envs + chunk;
+                    let next_val = f32x8::from_slice(&self.values[next_idx..]);
+                    let dones = f32x8::from_slice(&self.dones[next_idx..]);
+                    let non_term = one_vec - dones;
+                    (next_val, non_term)
+                };
+
+                // TD error: delta = r + gamma * V(s') * (1-done) - V(s)
+                let delta = rewards_vec + gamma_vec * next_value * next_non_terminal - values_vec;
+
+                // GAE: A = delta + gamma * lambda * (1-done) * A_prev
+                let new_gae = delta + gamma_vec * gae_lambda_vec * next_non_terminal * last_gae_vec;
+
+                // Store results
+                new_gae.copy_to_slice(&mut last_gae[chunk..]);
+                new_gae.copy_to_slice(&mut self.advantages[idx..]);
+            } else {
+                // Scalar fallback for remainder
+                for e in chunk..self.num_envs {
+                    let idx = step_idx + e;
+
+                    let (next_value, next_non_terminal) = if t == self.num_steps - 1 {
+                        (last_vals[e], 1.0 - self.dones[idx])
+                    } else {
+                        let next_idx = (t + 1) * self.num_envs + e;
+                        (self.values[next_idx], 1.0 - self.dones[next_idx])
+                    };
+
+                    let delta = self.rewards[idx] + gamma * next_value * next_non_terminal - self.values[idx];
+                    last_gae[e] = delta + gamma * gae_lambda * next_non_terminal * last_gae[e];
+                    self.advantages[idx] = last_gae[e];
+                }
+            }
+        }
+    }
+
+    /// SIMD returns computation: returns = advantages + values
+    #[cfg(feature = "simd")]
+    #[inline(always)]
+    fn compute_returns_simd(&mut self) {
+        use std::simd::f32x8;
+
+        const LANES: usize = 8;
+        let total = self.advantages.len();
+
+        // Process chunks of 8
+        for i in (0..total).step_by(LANES) {
+            if i + LANES <= total {
+                let adv = f32x8::from_slice(&self.advantages[i..]);
+                let val = f32x8::from_slice(&self.values[i..]);
+                let ret = adv + val;
+                ret.copy_to_slice(&mut self.returns[i..]);
+            } else {
+                // Scalar remainder
+                for j in i..total {
+                    self.returns[j] = self.advantages[j] + self.values[j];
+                }
+            }
+        }
     }
 }

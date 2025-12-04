@@ -20,7 +20,13 @@ Example:
 """
 
 from .base import Algorithm
-from .networks import ActorCritic, ContinuousActorCritic, DiscreteActorCritic
+from .exploration import ICM, RND
+from .networks import (
+    ActorCritic,
+    ContinuousActorCritic,
+    DiscreteActorCritic,
+    PopArtValueHead,
+)
 from .ppo import PPO
 
 __all__ = [
@@ -29,4 +35,7 @@ __all__ = [
     "ActorCritic",
     "DiscreteActorCritic",
     "ContinuousActorCritic",
+    "PopArtValueHead",
+    "RND",
+    "ICM",
 ]

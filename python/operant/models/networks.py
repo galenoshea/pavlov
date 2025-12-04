@@ -16,6 +16,93 @@ def layer_init(
     return layer
 
 
+class PopArtValueHead(nn.Module):
+    """PopArt: Preserving Outputs Precisely, while Adaptively Rescaling Targets.
+
+    Adaptive normalization for value function that handles non-stationary reward scales.
+    The key insight is to normalize the value target while preserving the unnormalized
+    output by rescaling the linear layer weights.
+
+    Paper: https://arxiv.org/abs/1602.07714
+    """
+
+    def __init__(self, input_dim: int, beta: float = 0.0001):
+        """Initialize PopArt value head.
+
+        Args:
+            input_dim: Input feature dimension.
+            beta: Exponential moving average coefficient for statistics updates.
+        """
+        super().__init__()
+        self.linear = nn.Linear(input_dim, 1)
+        self.beta = beta
+
+        # Running statistics (unnormalized)
+        self.register_buffer('mu', torch.zeros(1))
+        self.register_buffer('sigma', torch.ones(1))
+        self.register_buffer('nu', torch.zeros(1))  # Second moment for variance
+
+        # Initialize with orthogonal weights
+        nn.init.orthogonal_(self.linear.weight, 1.0)
+        nn.init.constant_(self.linear.bias, 0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: Input features, shape (batch, input_dim).
+
+        Returns:
+            Unnormalized value estimates, shape (batch, 1).
+        """
+        # Compute normalized output
+        normalized_value = self.linear(x)
+        # Denormalize using current statistics
+        return normalized_value * self.sigma + self.mu
+
+    def normalize_targets(self, targets: torch.Tensor) -> torch.Tensor:
+        """Normalize value targets using current statistics.
+
+        Args:
+            targets: Unnormalized targets, shape (batch,) or (batch, 1).
+
+        Returns:
+            Normalized targets, shape matching input.
+        """
+        return (targets - self.mu) / (self.sigma + 1e-8)
+
+    @torch.no_grad()
+    def update_stats(self, targets: torch.Tensor) -> None:
+        """Update running statistics and rescale weights to preserve outputs.
+
+        Args:
+            targets: Batch of unnormalized value targets, shape (batch,) or (batch, 1).
+        """
+        targets = targets.flatten()
+
+        # Store old statistics
+        old_mu = self.mu.clone()
+        old_sigma = self.sigma.clone()
+
+        # Update first moment (mean)
+        batch_mean = targets.mean()
+        self.mu = (1 - self.beta) * self.mu + self.beta * batch_mean
+
+        # Update second moment
+        batch_nu = (targets ** 2).mean()
+        self.nu = (1 - self.beta) * self.nu + self.beta * batch_nu
+
+        # Compute variance and standard deviation
+        variance = self.nu - self.mu ** 2
+        self.sigma = torch.sqrt(torch.clamp(variance, min=1e-4))
+
+        # Rescale weights and bias to preserve outputs
+        # New output = W * (sigma_old / sigma_new) * x + (mu_old - mu_new * sigma_old / sigma_new)
+        scale = old_sigma / (self.sigma + 1e-8)
+        self.linear.weight.data *= scale
+        self.linear.bias.data = self.linear.bias.data * scale + (old_mu - self.mu * scale)
+
+
 class ActorCritic(nn.Module):
     """Base class for actor-critic networks.
 

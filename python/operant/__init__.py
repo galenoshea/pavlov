@@ -256,32 +256,61 @@ class _ModelsModule:
 
     def __init__(self):
         object.__setattr__(self, '_loaded_module', None)
+        object.__setattr__(self, '_loading', False)
 
     def _load(self):
         if object.__getattribute__(self, '_loaded_module') is None:
+            # Prevent recursive loading
+            if object.__getattribute__(self, '_loading'):
+                raise ImportError("Recursive import detected in operant.models")
+            object.__setattr__(self, '_loading', True)
+
             try:
                 import torch  # noqa: F401
             except ImportError as e:
+                object.__setattr__(self, '_loading', False)
                 raise ImportError(
                     "operant.models requires PyTorch. "
                     "Install with: pip install operant[models] or pip install torch"
                 ) from e
-            from .models import Algorithm, PPO, ActorCritic, DiscreteActorCritic, ContinuousActorCritic
-            module = type('models', (), {
-                'Algorithm': Algorithm,
-                'PPO': PPO,
-                'ActorCritic': ActorCritic,
-                'DiscreteActorCritic': DiscreteActorCritic,
-                'ContinuousActorCritic': ContinuousActorCritic,
-            })()
-            object.__setattr__(self, '_loaded_module', module)
+
+            # Remove ourselves from sys.modules temporarily to allow real import
+            import sys
+            lazy_module = sys.modules.get('operant.models')
+            if lazy_module is self:
+                del sys.modules['operant.models']
+
+            try:
+                # Now import the real models package
+                from operant.models import (
+                    Algorithm, PPO, ActorCritic, DiscreteActorCritic,
+                    ContinuousActorCritic, PopArtValueHead, RND, ICM
+                )
+
+                module = type('models', (), {
+                    'Algorithm': Algorithm,
+                    'PPO': PPO,
+                    'ActorCritic': ActorCritic,
+                    'DiscreteActorCritic': DiscreteActorCritic,
+                    'ContinuousActorCritic': ContinuousActorCritic,
+                    'PopArtValueHead': PopArtValueHead,
+                    'RND': RND,
+                    'ICM': ICM,
+                })()
+                object.__setattr__(self, '_loaded_module', module)
+            finally:
+                # Restore ourselves in sys.modules
+                sys.modules['operant.models'] = self
+                object.__setattr__(self, '_loading', False)
+
         return object.__getattribute__(self, '_loaded_module')
 
     def __getattr__(self, name: str):
         return getattr(self._load(), name)
 
     def __dir__(self):
-        return ["Algorithm", "PPO", "ActorCritic", "DiscreteActorCritic", "ContinuousActorCritic"]
+        return ["Algorithm", "PPO", "ActorCritic", "DiscreteActorCritic",
+                "ContinuousActorCritic", "PopArtValueHead", "RND", "ICM"]
 
 
 # Create submodule instances and register in sys.modules for proper import support

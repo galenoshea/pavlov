@@ -2,6 +2,8 @@
 //!
 //! Provides PyO3-based bindings with zero-copy numpy array support.
 
+#![cfg_attr(feature = "simd", feature(portable_simd))]
+
 use numpy::{PyArray1, PyArray2, PyArrayMethods};
 use operant_core::VecEnvironment;
 use operant_envs::{CartPole, MountainCar, Pendulum};
@@ -15,7 +17,7 @@ mod tui;
 use tui::TUILogger;
 
 mod rl;
-use rl::RolloutBuffer;
+use rl::{AsyncEnvPool, RolloutBuffer, RunningNormalizer};
 
 /// High-performance vectorized CartPole environment.
 ///
@@ -728,13 +730,15 @@ fn register_tui_module(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-/// Register RL utilities module with RolloutBuffer.
+/// Register RL utilities module with RolloutBuffer, RunningNormalizer, and AsyncEnvPool.
 fn register_rl_module(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();
     let rl_mod = PyModule::new(py, "_rl")?;
 
     // Add RL classes to _rl submodule
     rl_mod.add_class::<RolloutBuffer>()?;
+    rl_mod.add_class::<RunningNormalizer>()?;
+    rl_mod.add_class::<AsyncEnvPool>()?;
 
     // Register submodule with parent
     parent.add_submodule(&rl_mod)?;
